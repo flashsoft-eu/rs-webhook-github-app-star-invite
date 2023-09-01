@@ -44,8 +44,6 @@ lazy_static! {
 
 use crate::ghb::config::get_config;
 
-use super::tokio_worker;
-
 static GITHUB_API_BASE : &str = "https://api.github.com";
 
 fn get_app_pk_from_base64 () -> String {
