@@ -10,6 +10,11 @@ use base64::engine::general_purpose::{GeneralPurpose, PAD};
 use lazy_static::lazy_static;
 use std::collections::HashMap;
 
+use std::io::Read;
+
+use crate::ghb::hmac::verify_signature;
+
+
 lazy_static! {
 
     static ref ALLOWED_ORGS: [&'static str; 2] = ["flashsoft-eu", "andrei0x309"];
@@ -410,13 +415,36 @@ fn handle_star_deleted (input: &Result<serde_json::Value, String>) {
 
 pub fn handle_hook(request : &Request) -> Response {
 
+    let mut data = request.data().expect("Oops, body already retrieved, problem \
+    in the server");
+
+    let mut buf = Vec::new();
+
+    match data.read_to_end(&mut buf) {
+        Ok(_) => (),
+        Err(_) => return Response::text("Failed to read body")
+        };
+
     let mut map = serde_json::Map::new();
-    let input = rouille::input::json_input::<serde_json::Value>(request).unwrap();
+    let input =  serde_json::from_slice::<serde_json::Value>(&buf).unwrap();
 
     if input.is_null() {
         return Response::json({
             map.insert("status".to_string(), serde_json::Value::String("error".to_string()));
             map.insert("message".to_string(), serde_json::Value::String("No body provided".to_string()));
+            &map}).with_status_code(400);
+    }
+
+
+    let signature = request.header("X-Hub-Signature-256").unwrap_or("").to_string();
+    let secret = get_config().github_webhook_secret.to_string();
+
+    let is_valid = verify_signature(buf, &signature, &secret);
+
+    if !is_valid {
+        return Response::json({
+            map.insert("status".to_string(), serde_json::Value::String("error".to_string()));
+            map.insert("message".to_string(), serde_json::Value::String("Invalid hmac signature check webhok secret".to_string()));
             &map}).with_status_code(400);
     }
 
