@@ -11,8 +11,14 @@ use lazy_static::lazy_static;
 use std::collections::HashMap;
 
 use std::io::Read;
+use std::sync::Mutex;
+
 
 use crate::ghb::hmac::verify_signature;
+
+
+static mut GLOBAL_INST_TOKEN: Option<Mutex<String>> = None;
+static mut GLOBAL_INST_TOKEN_EXP: Option<Mutex<i64>> = None;
 
 
 lazy_static! {
@@ -37,6 +43,8 @@ lazy_static! {
 
 
 use crate::ghb::config::get_config;
+
+use super::tokio_worker;
 
 static GITHUB_API_BASE : &str = "https://api.github.com";
 
@@ -93,6 +101,32 @@ struct Claims {
 }
 
 
+pub fn get_installation_token () -> String {
+    if check_token_expiration() {
+        return unsafe { GLOBAL_INST_TOKEN.as_ref().unwrap().lock().unwrap().to_string() };
+    }
+    return create_installation_token(ALLOWED_ORGS[0].to_string());
+}
+
+
+fn check_token_expiration () -> bool {
+    let now = Utc::now().timestamp();
+
+    unsafe {
+        if GLOBAL_INST_TOKEN_EXP.is_none() {
+            return false;
+        }
+    }
+
+    let exp = unsafe { GLOBAL_INST_TOKEN_EXP.as_ref().unwrap().lock().unwrap() };
+    
+    if now > (*exp - 60) {
+        return false;
+    }
+    return true;
+}
+
+
 fn create_installation_token (for_org: String) -> String {
     let inst_id = INSTALLATION_MAP.get(&for_org.as_str()).unwrap_or(&0);
     let url: String = format!("{}/app/installations/{}/access_tokens", GITHUB_API_BASE, inst_id);
@@ -115,6 +149,18 @@ fn create_installation_token (for_org: String) -> String {
     let body: serde_json::Value = serde_json::from_str(body).unwrap();
 
     let token = body["token"].as_str().unwrap_or("");
+    let exp = body["expires_at"].as_str().unwrap_or("");
+
+    let exp = exp.parse::<i64>().unwrap_or(0);
+
+    unsafe {
+        if GLOBAL_INST_TOKEN.is_none() {
+            GLOBAL_INST_TOKEN = Some(Mutex::new(token.to_string()));
+        }
+        if GLOBAL_INST_TOKEN_EXP.is_none() {
+            GLOBAL_INST_TOKEN_EXP = Some(Mutex::new(exp));
+        }
+    }
 
     return token.to_string();
 }
@@ -145,7 +191,6 @@ fn check_repo_and_org_allowed (input: &Result<serde_json::Value, String> ) -> bo
     let full_name = input["repository"]["full_name"].as_str().unwrap_or("");
     let repo: String = get_repo_from_fn(full_name.to_string());
     let org: String = get_org_from_fn(full_name.to_string());
-
 
     if !ALLOWED_ORGS.contains(&&org.as_str()) {
         return false;
@@ -190,9 +235,7 @@ fn gh_check_colaborator (org: &str, repo: &str, user: &str) -> bool {
     let url = format!("{}/repos/{}/{}/collaborators/{}", GITHUB_API_BASE, org, repo, user);
 
     let response: minreq::Request = minreq::get(url);
-    let send_result = add_github_req_header(&response, &create_installation_token(
-        ALLOWED_ORGS[0].to_string()
-    )).send();
+    let send_result = add_github_req_header(&response, &get_installation_token()).send();
 
     // println!("send_result: {:?}", send_result);
 
@@ -214,9 +257,7 @@ fn gh_invite_collaborator (org: &str, repo: &str, user: &str) -> bool {
     let url = format!("{}/repos/{}/{}/collaborators/{}", GITHUB_API_BASE, org, repo, user);
 
     let response: minreq::Request = minreq::put(url);
-    let send_result = add_github_req_header(&response, &create_installation_token(
-        ALLOWED_ORGS[0].to_string()
-    )).with_body("{\"permission\":\"pull\"}").send();
+    let send_result = add_github_req_header(&response, &get_installation_token()).with_body("{\"permission\":\"pull\"}").send();
 
     // println!("send_result: {:?}", std::str::from_utf8(&send_result.as_mut().unwrap().as_bytes()));
 
@@ -242,9 +283,7 @@ fn gh_delete_collaborator (org: &str, repo: &str, user: &str) -> bool {
         let url = format!("{}/repos/{}/{}/collaborators/{}", GITHUB_API_BASE, org, repo, user);
     
         let response: minreq::Request = minreq::delete(url);
-        let send_result = add_github_req_header(&response, &create_installation_token(
-            ALLOWED_ORGS[0].to_string()
-        )).send();
+        let send_result = add_github_req_header(&response, &get_installation_token()).send();
     
         if send_result.is_err() {
             return false;
@@ -459,9 +498,11 @@ pub fn handle_hook(request : &Request) -> Response {
             &map}).with_status_code(400);
     }
 
+    tokio::runtime::Runtime::new().unwrap().spawn(async move {
+        register_event_handler("star_created", handle_star_created, &ok_input);
+        register_event_handler("star_deleted", handle_star_deleted, &ok_input);
+    });
 
-    register_event_handler("star_created", handle_star_created, &ok_input);
-    register_event_handler("star_deleted", handle_star_deleted, &ok_input);
 
     Response::json({
         map.insert("status".to_string(), serde_json::Value::String("ok".to_string()));

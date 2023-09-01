@@ -3,9 +3,10 @@ mod ghb;
 
 use ghb::server::server_run; 
 use ghb::github::check_auth;
+use ghb::tokio_worker::periodic_refresh_inst_token;
 
-
-fn main() {
+#[tokio::main]
+async fn main() {
     dotenv().ok();
 
     if !check_auth() {
@@ -13,5 +14,10 @@ fn main() {
         return;
     }
 
+    tokio::spawn(async move {
+        periodic_refresh_inst_token().await;
+    });
+
+     
     server_run();
 }
