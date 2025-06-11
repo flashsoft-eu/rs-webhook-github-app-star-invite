@@ -1,14 +1,13 @@
-## Github App to create "semi-open" repositories
+# Github Service to create "semi-open" repositories
 
-### How it works
+## How it works
 
-So currently this app works like this:
+So currently the service works like this(was simplified in 2025):
 
-- there is a map of of preview repos and their corresponding "real" repos
-- the current implementation uses an app that installed on two organizations(a user counts as an organization too)
-- app will monitor star and unstar events on preview repos
-- when a preview repo is starred, the user will be invited to the "real" repo
-- when a preview repo is unstarred, the user will be removed from the "real" repo
+- a single repo is montored for stars and unstars
+- when a user stars the repo, an invite is sent to the user to join the organization
+- the user accepts the invite and becomes a member of the organization
+- the organisation members can see all the private repositories of the organization
 
 Also there is an user bot that will monitor the user's starred repos and will comment to discusion if the user stars a preview repo and the invite is sent.
 
@@ -16,7 +15,7 @@ The user bot uses private API of GH because there are three kind of discussion r
 
 ### Motivation
 
-The motivation behind this app is to create a way to share code with people other than making a repo directly public. 
+The motivation behind this app is to create a way to share code with people other than making a repo directly public.
 
 ### Notes
 
@@ -26,8 +25,8 @@ Creating invites has a very low rate limit, so you can invite less than a dozen 
 
 [https://github.com/flashsoft-eu/node-webhook-github-app-star-invite](https://github.com/flashsoft-eu/node-webhook-github-app-star-invite)
 
-### Current development status
+The node version might difffer from the one a bit because both have been updated since, intially they had same functionality.
 
-Working but bare.
+### License
 
-
+MIT License

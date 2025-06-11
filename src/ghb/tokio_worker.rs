@@ -1,6 +1,5 @@
 use tokio::time::Duration;
 
-
 use crate::ghb::github::get_installation_token;
 
 pub async fn periodic_refresh_inst_token() {
@@ -14,5 +13,6 @@ pub async fn periodic_refresh_inst_token() {
 
         println!("Exec refresh token interval count: {}", interval_count);
         tokio::time::sleep(interval).await;
+
     }
 }

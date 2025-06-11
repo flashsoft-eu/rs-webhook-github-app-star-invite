@@ -1,509 +1,426 @@
-
-use rouille::Request;
-use rouille::Response;
-
-use chrono::Utc;
+use rouille::{ Request, Response };
+use tokio::runtime::Handle as TokioHandle;
+use std::io::Read;
 
 use base64::alphabet;
-use base64::engine::Engine;
 use base64::engine::general_purpose::{GeneralPurpose, PAD};
-use lazy_static::lazy_static;
-use std::collections::HashMap;
-
-use std::io::Read;
-use std::sync::Mutex;
-
-
-use crate::ghb::hmac::verify_signature;
-
-
-static mut GLOBAL_INST_TOKEN: Option<Mutex<String>> = None;
-static mut GLOBAL_INST_TOKEN_EXP: Option<Mutex<i64>> = None;
-
-
-lazy_static! {
-
-    static ref ALLOWED_ORGS: [&'static str; 2] = ["flashsoft-eu", "andrei0x309"];
-
-    static ref ALLOWED_REPOS: [&'static str; 1] = ["deno-slack-api-backup-preview"];
-
-    static ref REPO_MAP: HashMap<&'static str, String> = {
-        let mut map = HashMap::new();
-        map.insert("deno-slack-api-backup-preview", String::from("deno-slack-user-api"));
-        map
-    };
-
-    static ref INSTALLATION_MAP: HashMap<&'static str, i64> = {
-        let mut map = HashMap::new();
-        map.insert("flashsoft-eu", 40959841);
-        map.insert("andrei0x309", 40959837);
-        map
-    };
-}
+use base64::engine::Engine;
+use chrono::{Utc}; // Updated for specific format
+use once_cell::sync::OnceCell; // For safely initializing global mutable data once
+use std::sync::Mutex; // For thread-safe mutable access to global data
 
 
 use crate::ghb::config::get_config;
+use crate::ghb::hmac::verify_signature; // get_config is used here implicitly by global config
+use crate::ghb::constants::GITHUB_API_BASE;
+use crate::ghb::constants::{
+    ALLOWED_ORGS,
+    ALLOWED_REPOS,
+    INSTALLATION_MAP,
+    REPO_MAP
+};
 
-static GITHUB_API_BASE : &str = "https://api.github.com";
+use crate::ghb::ghapi::headers::add_github_req_header;
+use crate::ghb::ghapi::organisations::{
+    gh_invite_user_to_org, gh_rem_user_from_org, gh_check_member
+};
+use crate::ghb::ghapi::private_gh::{
+    pv_gh_announce_collaborator_multipart
+};
 
-fn get_app_pk_from_base64 () -> String {
+static GLOBAL_INST_TOKEN: OnceCell<Mutex<String>> = OnceCell::new();
+static GLOBAL_INST_TOKEN_EXP: OnceCell<Mutex<i64>> = OnceCell::new();
+
+fn get_app_pk_from_base64() -> String {
     let engine = GeneralPurpose::new(&alphabet::STANDARD, PAD);
-    let decoded = engine.decode(get_config().github_app_pk_base64.as_bytes()).unwrap();
-    let app_pk = String::from_utf8(decoded).unwrap();
-    return app_pk;
-}
-
-fn get_user_cookie_from_base64 () -> String {
-    let engine = GeneralPurpose::new(&alphabet::STANDARD, PAD);
-    let decoded = engine.decode(get_config().bot_cookie_base64.as_bytes()).unwrap();
-    let cookie = String::from_utf8(decoded).unwrap();
-    return cookie;
+    let decoded = engine
+        .decode(get_config().github_app_pk_base64.as_bytes())
+        .unwrap();
+    String::from_utf8(decoded).unwrap()
 }
 
 
-fn create_token () -> String {
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct Claims {
-    aud: Option<String>,         // Optional. Audience
-    exp: usize,          // Required (validate_exp defaults to true in validation). Expiration time (as UTC timestamp)
-    iat: Option<usize>,          // Optional. Issued at (as UTC timestamp)
-    iss: Option<String>,         // Optional. Issuer
-    nbf: Option<usize>,          // Optional. Not Before (as UTC timestamp)
-    sub: Option<String>,         // Optional. Subject (whom token refers to)
-}
+fn create_token() -> String {
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct Claims {
+        aud: Option<String>,
+        exp: usize,
+        iat: Option<usize>,
+        iss: Option<String>,
+        nbf: Option<usize>,
+        sub: Option<String>,
+    }
 
     let now = Utc::now();
     let ts_60s_before = (now.timestamp() - 60).try_into().unwrap();
-    let ts_6e2s_after = (now.timestamp() + 600).try_into().unwrap();
+    let ts_5e2s_after = (now.timestamp() + 500).try_into().unwrap();
 
     let claims = Claims {
-        exp: ts_6e2s_after,
+        exp: ts_5e2s_after,
         iat: Some(ts_60s_before),
         iss: Some(get_config().github_app_id.to_owned()),
         nbf: Some(ts_60s_before),
         sub: None,
-        aud: None
+        aud: None,
     };
 
     let secret = get_app_pk_from_base64();
-    let key = jsonwebtoken::EncodingKey::from_rsa_pem( secret.as_bytes() ).unwrap();
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(secret.as_bytes()).unwrap();
     let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
     let token = jsonwebtoken::encode(&header, &claims, &key);
-    
+
     if token.is_err() {
-        println!("token error: {:?}", token);
-        return "".to_string();
+        eprintln!("token error: {:?}", token); // Use eprintln for errors
+        return String::new(); // Return empty string on error
     }
-    return token.unwrap();
+    token.unwrap()
 }
 
-
-pub fn get_installation_token () -> String {
+pub fn get_installation_token() -> String {
     if check_token_expiration() {
-        return unsafe { GLOBAL_INST_TOKEN.as_ref().unwrap().lock().unwrap().to_string() };
+        // Access the token from the safely initialized global
+        let token_mutex = GLOBAL_INST_TOKEN
+            .get()
+            .expect("GLOBAL_INST_TOKEN not initialized when expected");
+        token_mutex.lock().unwrap().to_string()
+    } else {
+        create_installation_token(ALLOWED_ORGS[0].to_string())
     }
-    return create_installation_token(ALLOWED_ORGS[0].to_string());
 }
 
-
-fn check_token_expiration () -> bool {
+fn check_token_expiration() -> bool {
     let now = Utc::now().timestamp();
 
-    unsafe {
-        if GLOBAL_INST_TOKEN_EXP.is_none() {
-            return false;
-        }
-    }
+    // Safely get the Mutex. If it's not initialized, return false.
+    let global_exp_mutex = match GLOBAL_INST_TOKEN_EXP.get() {
+        Some(m) => m,
+        None => return false,
+    };
 
-    let exp = unsafe { GLOBAL_INST_TOKEN_EXP.as_ref().unwrap().lock().unwrap() };
-    
+    let exp = global_exp_mutex.lock().unwrap();
+
     if now > (*exp - 60) {
+        // Check if now is greater than 60 seconds before expiration
         return false;
     }
-    return true;
+    true // Token is still valid
 }
 
-
-fn create_installation_token (for_org: String) -> String {
-    let inst_id = INSTALLATION_MAP.get(&for_org.as_str()).unwrap_or(&0);
-    let url: String = format!("{}/app/installations/{}/access_tokens", GITHUB_API_BASE, inst_id);
-    let response: minreq::Request = minreq::post(url);
+fn create_installation_token(for_org: String) -> String {
+    let inst_id = INSTALLATION_MAP.get(for_org.as_str()).unwrap_or(&0);
+    let url = format!(
+        "{}/app/installations/{}/access_tokens",
+        GITHUB_API_BASE, inst_id
+    );
+    let response = minreq::post(url);
     let send_result = add_github_req_header(&response, &create_token()).send();
 
     if send_result.is_err() {
-        return "".to_string();
+        eprintln!(
+            "Error sending request for installation token: {:?}",
+            send_result.err()
+        );
+        return String::new();
     }
-
 
     let send_result = send_result.unwrap();
 
     if send_result.status_code != 201 {
-        return "".to_string();
+        eprintln!(
+            "Failed to get installation token, status code: {}",
+            send_result.status_code
+        );
+        eprintln!("Response body: {}", send_result.as_str().unwrap_or(""));
+        return String::new();
     }
 
     let body = send_result.as_str().unwrap_or("");
+    let body_json: serde_json::Value = serde_json::from_str(body).unwrap_or_else(|e| {
+        eprintln!("Failed to parse installation token response: {}", e);
+        serde_json::Value::Null
+    });
 
-    let body: serde_json::Value = serde_json::from_str(body).unwrap();
+    let token_str = body_json["token"].as_str().unwrap_or("");
+    let exp_str = body_json["expires_at"].as_str().unwrap_or("");
 
-    let token = body["token"].as_str().unwrap_or("");
-    let exp = body["expires_at"].as_str().unwrap_or("");
-
-    let exp = exp.parse::<i64>().unwrap_or(0);
-
-    unsafe {
-        if GLOBAL_INST_TOKEN.is_none() {
-            GLOBAL_INST_TOKEN = Some(Mutex::new(token.to_string()));
+    // Parse expiration date from ISO 8601 string to timestamp
+    let exp_datetime = match chrono::DateTime::parse_from_rfc3339(exp_str) {
+        Ok(dt) => dt.timestamp(),
+        Err(e) => {
+            eprintln!("Failed to parse expiration date '{}': {}", exp_str, e);
+            0 // Default to 0 on error
         }
-        if GLOBAL_INST_TOKEN_EXP.is_none() {
-            GLOBAL_INST_TOKEN_EXP = Some(Mutex::new(exp));
-        }
-    }
+    };
 
-    return token.to_string();
+    // Safely update GLOBAL_INST_TOKEN and GLOBAL_INST_TOKEN_EXP
+    let mut inst_token_guard = GLOBAL_INST_TOKEN
+        .get_or_init(|| Mutex::new(String::new()))
+        .lock()
+        .unwrap();
+    inst_token_guard.clear();
+    inst_token_guard.push_str(token_str);
+
+    let mut inst_exp_guard = GLOBAL_INST_TOKEN_EXP
+        .get_or_init(|| Mutex::new(0))
+        .lock()
+        .unwrap();
+    *inst_exp_guard = exp_datetime;
+
+    token_str.to_string()
 }
 
 
-fn add_github_req_header<'a, 'b>(response: &'a minreq::Request, token: &'b str) -> minreq::Request {
-    let mut modified_response =  response.clone();
-    modified_response = modified_response.with_header("Accept", "application/vnd.github+json");
-    modified_response = modified_response.with_header("Authorization", format!("Bearer {}", token));
-    modified_response = modified_response.with_header("X-GitHub-Api-Version", "2022-11-28");
-    modified_response = modified_response.with_header("User-Agent", format!("Rust ghb/{}", env!("CARGO_PKG_VERSION")));
-    modified_response
-}
 
-fn get_repo_from_fn (full_name: String) -> String {
+fn get_repo_from_fn(full_name: String) -> String {
     let splits: Vec<&str> = full_name.split('/').collect();
-    return splits.as_slice()[1].to_string();
+    splits.get(1).unwrap_or(&"").to_string() // Use .get() and unwrap_or for safer access
 }
 
-fn get_org_from_fn (full_name: String) -> String {
+fn get_org_from_fn(full_name: String) -> String {
     let splits: Vec<&str> = full_name.split('/').collect();
-    return splits.as_slice()[0].to_string();
+    splits.get(0).unwrap_or(&"").to_string() // Use .get() and unwrap_or for safer access
 }
-  
 
-fn check_repo_and_org_allowed (input: &Result<serde_json::Value, String> ) -> bool {
-    let input =  input.as_ref().unwrap();
-    let full_name = input["repository"]["full_name"].as_str().unwrap_or("");
+fn check_repo_and_org_allowed(input: &Result<serde_json::Value, String>) -> bool {
+    let input_value = input.as_ref().unwrap(); // Assuming input is always Ok here
+    let full_name = input_value["repository"]["full_name"]
+        .as_str()
+        .unwrap_or("");
     let repo: String = get_repo_from_fn(full_name.to_string());
     let org: String = get_org_from_fn(full_name.to_string());
 
-    if !ALLOWED_ORGS.contains(&&org.as_str()) {
+    if !ALLOWED_ORGS.contains(&org.as_str()) {
         return false;
     }
-    if !ALLOWED_REPOS.contains(&&repo.as_str()) {
+    if !ALLOWED_REPOS.contains(&repo.as_str()) {
         return false;
     }
-    return true;
+    true
 }
-
 
 pub fn check_auth() -> bool {
- 
-let url = format!("{}/app", GITHUB_API_BASE);
+    let url = format!("{}/app", GITHUB_API_BASE);
 
-let response: minreq::Request = minreq::get(url);
-let send_result = add_github_req_header(&response, &create_token()).send();
+    let response = minreq::get(url);
+    let send_result = add_github_req_header(&response, &create_token()).send();
 
-// println!("send_result: {:?}", send_result);
-
-if send_result.is_err() {
-    return false;
-}
-
-let send_result = send_result.unwrap();
-
-if send_result.status_code != 200 {
-    return false;
-}
-
-return true;
-
-}
-
-fn gh_check_colaborator (org: &str, repo: &str, user: &str) -> bool {
-//     curl -L \
-//   -H "Accept: application/vnd.github+json" \
-//   -H "Authorization: Bearer <YOUR-TOKEN>" \
-//   -H "X-GitHub-Api-Version: 2022-11-28" \
-//   https://api.github.com/repos/OWNER/REPO/collaborators/USERNAME
-
-    let url = format!("{}/repos/{}/{}/collaborators/{}", GITHUB_API_BASE, org, repo, user);
-
-    let response: minreq::Request = minreq::get(url);
-    let send_result = add_github_req_header(&response, &get_installation_token()).send();
-
-    // println!("send_result: {:?}", send_result);
-
-    if send_result.is_err() {
-        return false;
-    }
-
-    let send_result = send_result.unwrap();
-
-    if send_result.status_code != 204 {
-        return false;
-    }
-
-    return true;
-}
-
-fn gh_invite_collaborator (org: &str, repo: &str, user: &str) -> bool {
- 
-    let url = format!("{}/repos/{}/{}/collaborators/{}", GITHUB_API_BASE, org, repo, user);
-
-    let response: minreq::Request = minreq::put(url);
-    let send_result = add_github_req_header(&response, &get_installation_token()).with_body("{\"permission\":\"pull\"}").send();
-
-    // println!("send_result: {:?}", std::str::from_utf8(&send_result.as_mut().unwrap().as_bytes()));
-
-    // println!("send_result: {:?}", send_result);
-
-    if send_result.is_err() {
-        return false;
-    }
-
-    let send_result = send_result.unwrap();
-    
-
-    if [204, 201].contains(&send_result.status_code) {
-        return true;
-    }
-
-    return false;
-
-}
-
-fn gh_delete_collaborator (org: &str, repo: &str, user: &str) -> bool {
-     
-        let url = format!("{}/repos/{}/{}/collaborators/{}", GITHUB_API_BASE, org, repo, user);
-    
-        let response: minreq::Request = minreq::delete(url);
-        let send_result = add_github_req_header(&response, &get_installation_token()).send();
-    
-        if send_result.is_err() {
+    let send_result = match send_result {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("Auth check request failed status: {:?}", e);
             return false;
         }
-    
-        let send_result = send_result.unwrap();
-        
-    
-        if [204, 201].contains(&send_result.status_code) {
-            return true;
-        }
-    
-        return false;
+    };
 
-}
-
-fn pv_gh_user_header (response: &minreq::Request) -> minreq::Request {
-    
-    let cookie =  get_user_cookie_from_base64();
-
-    // println!("cookie: {:?}", cookie);
-    
-    let mut modified_response = response.clone();
-    modified_response = modified_response.with_header("Accept", "text/html");
-    modified_response = modified_response.with_header("Content-Type", "text/html");
-    modified_response = modified_response.with_header("Cookie", cookie);
-    modified_response = modified_response.with_header("User-Agent", "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36");
-    modified_response = modified_response.with_header("Origin", "https://github.com");
-    modified_response = modified_response.with_header("Referer", format!("https://github.com/orgs/{}/discussions/1", ALLOWED_ORGS[0]));
-    modified_response = modified_response.with_header("DNT", "1");
-    modified_response = modified_response.with_header("Pragma", "no-cache");
-    modified_response = modified_response.with_header("Sec-Ch-Ua", "\"Chromium\";v=\"116\", \"Not)A;Brand\";v=\"24\", \"Brave\";v=\"116\"");
-    modified_response = modified_response.with_header("Sec-Ch-Ua-Mobile", "?1");
-    modified_response = modified_response.with_header("Sec-Ch-Ua-Platform", "\"Android\"");
-    modified_response = modified_response.with_header("Sec-Fetch-Dest", "empty");
-    modified_response = modified_response.with_header("Sec-Fetch-Mode", "cors");
-    modified_response = modified_response.with_header("Sec-Fetch-Site", "same-origin");
-    modified_response = modified_response.with_header("Sec-Gpc", "1");
-
-    modified_response
-}
-
-
-fn pv_gh_get_crsf_token () -> String {
-
-    let url = format!("https://github.com/orgs/{}/discussions/1", ALLOWED_ORGS[0]);
-
-    // println!("url: {:?}", url);
-
-    let req: minreq::Request = minreq::get(url);
-    let req = pv_gh_user_header(&req);
-    let send_result = req.send();
-    
-    if send_result.is_err() {
-        return "".to_string();
-    }
-
-    let send_result = send_result.unwrap();
-    let body = send_result.as_str().unwrap_or("");
-
- 
-    let re = regex::Regex::new("/discussions/1/comments.*?authenticity.*?value=(?:\"|')(.*?)(?:\"|')").unwrap();
-
-
-    let token = re.captures(body);
-
-    if token.is_none() {
-        return "".to_string();
-    }
- 
-    let token =  token.unwrap().get(1).map_or("", |m| m.as_str());
-
-    // println!("token: {:?}", token);
-
-    return token.to_string();
-}
-
-fn pv_gh_announce_collaborator ( user: String, repo: String ) -> bool {
- 
-    let token = pv_gh_get_crsf_token();
-
-    if token == "" {
-        println! ("crfs token not found");
+    if send_result.status_code != 200 {
+        eprintln!(
+            "Auth check failed, status code: {}",
+            send_result.status_code
+        );
+        eprintln!("Response body: {}", send_result.as_str().unwrap_or(""));
         return false;
     }
-
-    let url = format!("https://github.com/{}/discussions-host/discussions/1/comments", ALLOWED_ORGS[0]);
-    
-    let req: minreq::Request = minreq::post(url);
-    let mut req = pv_gh_user_header(&req);
-    req = req.with_header("Content-Type", "application/x-www-form-urlencoded");
-    
-    let date = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let message = format!("[Automated] @{} has been invited to the repo {}. Invitation was sent at {}",  user, repo, date);
-
-    let body = format!("timestamp={}&comment[body]={}&authenticity_token={}&required_field_609c=&timestamp_secret=&saved_reply_id=&path=&line=&start_line=&preview_side=&preview_start_side=&start_commit_oid=&end_commit_oid=&base_commit_oid=&comment_id=", Utc::now().timestamp(), message, token);
-    let send_result = req.with_body(body).send();
-
-    if send_result.is_err() {
-        return false;
-    }
-
-    return true;
+    true
 }
+
 
 
 fn get_event_type(input: &Result<serde_json::Value, String>) -> String {
-    let input =  input.as_ref().unwrap();
-    let action = input["action"].as_str().unwrap_or("");
-    let starred_url = input["sender"]["starred_url"].as_str().unwrap_or("");
+    let input_value = input.as_ref().unwrap();
+    let action = input_value["action"].as_str().unwrap_or("");
+    let starred_url = input_value["sender"]["starred_url"].as_str().unwrap_or("");
 
-    if action == "created" && starred_url != "" {
+    if action == "created" && !starred_url.is_empty() {
         return "star_created".to_string();
     }
-    if action == "deleted" && starred_url != "" {
+    if action == "deleted" && !starred_url.is_empty() {
         return "star_deleted".to_string();
     }
-    return "".to_string();
+    String::new()
 }
 
-
-fn register_event_handler(event_type: &str, handler: fn(input: &Result<serde_json::Value, String>) -> (), input: &Result<serde_json::Value, String>) {
+// Handler functions need to accept a `&serde_json::Value` if `Ok` is already unwrapped
+fn register_event_handler(
+    event_type: &str,
+    handler: fn(input: &serde_json::Value),
+    input_value: &serde_json::Value,
+) {
     const AVAILABLE_EVENTS: [&str; 2] = ["star_created", "star_deleted"];
     if AVAILABLE_EVENTS.contains(&event_type) {
-        let req_event_type: &str = &get_event_type(&input);
+        // Need to clone the input_value for get_event_type as it expects &Result<V,S>
+        // This is a bit awkward. It's better to pass `serde_json::Value` directly.
+        let temp_input_result = Ok(input_value.clone());
+        let req_event_type: &str = &get_event_type(&temp_input_result);
+
         if req_event_type == event_type {
-            handler(&input);
+            handler(input_value); // Pass the raw Value
         }
     } else {
-        println!("Event type not available");
+        eprintln!("Event type '{}' not available", event_type);
     }
 }
 
-fn handle_star_created (input: &Result<serde_json::Value, String>) {
-    let full_name = input.as_ref().unwrap()["repository"]["full_name"].as_str().unwrap_or("");
+fn handle_star_created(input: &serde_json::Value) {
+    // Changed signature
+    let full_name = input["repository"]["full_name"].as_str().unwrap_or("");
     let repo: String = get_repo_from_fn(full_name.to_string());
-    let user = input.as_ref().unwrap()["sender"]["login"].as_str().unwrap_or("");
-    let asoc_repo = REPO_MAP.get(&repo.as_str()).unwrap_or(&String::from("")).to_string();
-    let is_colab = gh_check_colaborator( ALLOWED_ORGS[0], &asoc_repo, user );
-    if is_colab {
-        println!("User {} is colaborator on repo {}, returning", user, asoc_repo);
+    let user_id = input["sender"]["id"].as_i64().unwrap_or_default();
+    let user = input["sender"]["login"].as_str().unwrap_or("");
+    let asoc_repo = REPO_MAP
+        .get(repo.as_str())
+        .unwrap_or(&String::new())
+        .to_string(); // Use String::new()
+    let is_member = gh_check_member(ALLOWED_ORGS[0], user);
+    if is_member {
+        println!(
+            "User {} is member in org {}, returning",
+            user, asoc_repo
+        );
         return;
     }
-    let is_inv_ok = gh_invite_collaborator( ALLOWED_ORGS[0], &asoc_repo, user );
+    println!("User id {} is not member in org {}", user_id, asoc_repo);
+    let is_inv_ok = gh_invite_user_to_org(ALLOWED_ORGS[0], user_id);
     if is_inv_ok {
         println!("User {} invited to repo {}", user, asoc_repo);
-        pv_gh_announce_collaborator(user.to_string(), asoc_repo);
-    } 
-
+        pv_gh_announce_collaborator_multipart(user.to_string());
+    } else {
+        eprintln!("Failed to invite user {} to repo {}", user, asoc_repo);
+    }
 }
 
-fn handle_star_deleted (input: &Result<serde_json::Value, String>) {
-    let full_name = input.as_ref().unwrap()["repository"]["full_name"].as_str().unwrap_or("");
+fn handle_star_deleted(input: &serde_json::Value) {
+    // Changed signature
+    let full_name = input["repository"]["full_name"].as_str().unwrap_or("");
     let repo: String = get_repo_from_fn(full_name.to_string());
-    let user = input.as_ref().unwrap()["sender"]["login"].as_str().unwrap_or("");
-    let asoc_repo = REPO_MAP.get(&repo.as_str()).unwrap_or(&String::from("")).to_string();
-    let is_colab = gh_check_colaborator( ALLOWED_ORGS[0], &asoc_repo, user );
-    if !is_colab {
-        println!("User {} is not colaborator on repo {}, returning", user, asoc_repo);
+    let user = input["sender"]["login"].as_str().unwrap_or("");
+    let asoc_repo = REPO_MAP
+        .get(repo.as_str())
+        .unwrap_or(&String::new())
+        .to_string(); // Use String::new()
+    let is_member = gh_check_member(ALLOWED_ORGS[0], user);
+    if !is_member {
+        println!(
+            "User {} is not a member in org {}, returning",
+            user, asoc_repo
+        );
         return;
     }
-    let is_del_ok = gh_delete_collaborator( ALLOWED_ORGS[0], &asoc_repo, user );
+    let is_del_ok = gh_rem_user_from_org(ALLOWED_ORGS[0], user);
     if is_del_ok {
         println!("User {} deleted from repo {}", user, asoc_repo);
+    } else {
+        eprintln!("Failed to delete user {} from repo {}", user, asoc_repo);
     }
 }
 
-
-pub fn handle_hook(request : &Request) -> Response {
-
-    let mut data = request.data().expect("Oops, body already retrieved, problem \
-    in the server");
+pub fn handle_hook(request: &Request,  runtime_handle: TokioHandle) -> Response {
+    let mut data = request
+        .data()
+        .expect("Oops, body already retrieved, problem in the server");
 
     let mut buf = Vec::new();
 
     match data.read_to_end(&mut buf) {
         Ok(_) => (),
-        Err(_) => return Response::text("Failed to read body")
-        };
+        Err(e) => {
+            eprintln!("Failed to read request body: {}", e);
+            return Response::text("Failed to read body").with_status_code(500);
+        }
+    };
 
     let mut map = serde_json::Map::new();
-    let input =  serde_json::from_slice::<serde_json::Value>(&buf).unwrap();
+    let input_value: serde_json::Value = match serde_json::from_slice(&buf) {
+        Ok(val) => val,
+        Err(e) => {
+            eprintln!("Failed to parse request body as JSON: {}", e);
+            map.insert(
+                "status".to_string(),
+                serde_json::Value::String("error".to_string()),
+            );
+            map.insert(
+                "message".to_string(),
+                serde_json::Value::String(format!("Invalid JSON body: {}", e)),
+            );
+            return Response::json(&map).with_status_code(400);
+        }
+    };
 
-    if input.is_null() {
+    if input_value.is_null() {
         return Response::json({
-            map.insert("status".to_string(), serde_json::Value::String("error".to_string()));
-            map.insert("message".to_string(), serde_json::Value::String("No body provided".to_string()));
-            &map}).with_status_code(400);
+            map.insert(
+                "status".to_string(),
+                serde_json::Value::String("error".to_string()),
+            );
+            map.insert(
+                "message".to_string(),
+                serde_json::Value::String("No body provided or body is null".to_string()),
+            );
+            &map
+        })
+        .with_status_code(400);
     }
 
-
-    let signature = request.header("X-Hub-Signature-256").unwrap_or("").to_string();
-    let secret = get_config().github_webhook_secret.to_string();
+    let signature = request
+        .header("X-Hub-Signature-256")
+        .unwrap_or("")
+        .to_string();
+    let secret = get_config().github_webhook_secret.to_string(); // Assuming get_config() is safe after init_config()
 
     let is_valid = verify_signature(buf, &signature, &secret);
 
     if !is_valid {
         return Response::json({
-            map.insert("status".to_string(), serde_json::Value::String("error".to_string()));
-            map.insert("message".to_string(), serde_json::Value::String("Invalid hmac signature check webhok secret".to_string()));
-            &map}).with_status_code(400);
+            map.insert(
+                "status".to_string(),
+                serde_json::Value::String("error".to_string()),
+            );
+            map.insert(
+                "message".to_string(),
+                serde_json::Value::String(
+                    "Invalid hmac signature, check webhook secret".to_string(),
+                ),
+            );
+            &map
+        })
+        .with_status_code(400);
     }
 
-    let ok_input = Ok(input);
-
-    let is_allowed = check_repo_and_org_allowed(&ok_input);
+    let is_allowed = check_repo_and_org_allowed(&Ok(input_value.clone())); // Pass a clone for the check
 
     if !is_allowed {
         return Response::json({
-            map.insert("status".to_string(), serde_json::Value::String("error".to_string()));
-            map.insert("message".to_string(), serde_json::Value::String("Not allowed repo / org".to_string()));
-            &map}).with_status_code(400);
+            map.insert(
+                "status".to_string(),
+                serde_json::Value::String("error".to_string()),
+            );
+            map.insert(
+                "message".to_string(),
+                serde_json::Value::String("Not allowed repo / org".to_string()),
+            );
+            &map
+        })
+        .with_status_code(400);
     }
 
-    tokio::runtime::Runtime::new().unwrap().spawn(async move {
-        register_event_handler("star_created", handle_star_created, &ok_input);
-        register_event_handler("star_deleted", handle_star_deleted, &ok_input);
+    // Get a handle to the current Tokio runtime and spawn the async tasks
+    let input_value_clone = input_value.clone(); // Clone for the spawned task
+    runtime_handle.spawn(async move {
+        // Pass the cloned `serde_json::Value` directly to handlers
+        register_event_handler("star_created", handle_star_created, &input_value_clone);
+        register_event_handler("star_deleted", handle_star_deleted, &input_value_clone);
     });
 
-
     Response::json({
-        map.insert("status".to_string(), serde_json::Value::String("ok".to_string()));
-        map.insert("message".to_string(), serde_json::Value::String("ok".to_string()));
-        &map}).with_status_code(200)
+        map.insert(
+            "status".to_string(),
+            serde_json::Value::String("ok".to_string()),
+        );
+        map.insert(
+            "message".to_string(),
+            serde_json::Value::String("Webhook processed".to_string()),
+        ); // More descriptive message
+        &map
+    })
+    .with_status_code(200)
 }
